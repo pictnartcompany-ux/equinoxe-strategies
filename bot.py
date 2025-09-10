@@ -26,11 +26,9 @@ HF_HEADERS = {"Authorization": f"Bearer {os.environ.get('HF_TOKEN', '')}"}
 # Utilitaires
 # =============
 def clean_html(s: str) -> str:
-    """Supprime les balises HTML et normalise l'espace."""
     return BeautifulSoup(s or "", "html.parser").get_text(" ", strip=True)
 
 def strip_boilerplate(txt: str) -> str:
-    """Retire les signatures RSS du type 'The post ... appeared first on ...' et les trackers."""
     if not txt:
         return ""
     txt = re.sub(r"The post .*? appeared first on .*?$", "", txt, flags=re.IGNORECASE | re.DOTALL)
@@ -38,12 +36,10 @@ def strip_boilerplate(txt: str) -> str:
     return txt.strip()
 
 def score(text: str) -> int:
-    """Score par mots-clés selon les convictions."""
     t = (text or "").lower()
     return sum(w for k, w in BELIEFS.items() if k in t)
 
 def pick_best_item():
-    """Parcourt les flux et retourne le meilleur item au-dessus du seuil."""
     items = []
     for url in SOURCES:
         feed = feedparser.parse(url)
@@ -72,32 +68,96 @@ def fetch_article_text(url: str) -> str:
             tag.decompose()
         ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
         text = " ".join(ps)
-        return text[:4000]
+        return text[:8000]
     except Exception:
         return ""
 
-def build_context(title: str, summary: str, link: str) -> str:
-    """Construit un contexte riche (titre+résumé+article) pour de meilleurs résumés."""
+def build_context(title: str, summary: str, link: str) -> tuple[str, str]:
+    """Construit un contexte riche + retourne aussi le plein texte pour l'extraction des signaux."""
     article = fetch_article_text(link)
     base = f"{title}. {summary}".strip()
-    ctx = (base + "\n\n" + article).strip()
-    return ctx[:4000] if ctx else base[:1000]
+    ctx = (base + ("\n\n" + article if article else "")).strip()
+    ctx = ctx[:4000] if ctx else base[:1000]
+    return ctx, article
 
-def extractive_fallback(text: str, k=5):
-    """Fallback: sélectionne 4–5 phrases informatives si l'IA répond mal."""
-    sents = re.split(r"(?<=[.!?])\s+", text or "")
-    scored = []
-    for s in sents:
-        sl = s.strip()
-        if 40 <= len(sl) <= 240:
-            scored.append((score(sl) + min(len(sl)//60, 3), sl))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    out = [s for _, s in scored[:k]]
-    if not out:
-        out = [(text or "")[:200] or "Point clé à surveiller."]
+# -------- Extraction de signaux (acteurs / chiffres / dates) ----------
+MONTHS = r"(janv\.?|févr\.?|mars|avr\.?|mai|juin|juil\.?|août|sept\.?|oct\.?|nov\.?|déc\.?|january|february|march|april|may|june|july|august|september|october|november|december)"
+YEAR = r"(20\d{2}|19\d{2})"
+PCT = r"\b\d{1,3}(?:[.,]\d+)?\s?%\b"
+MONEY = r"(?:\$|€)\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?\s?(?:bn|billion|milliard|milliards|m|million|millions|k)?"
+PLAIN_NUM = r"\b\d{2,4}(?:[.,]\d+)?\b"
+
+def extract_actors(text: str, max_items=6):
+    # Séquences de mots Capitalisés (2 à 4), filtre basique
+    cand = re.findall(r"\b([A-Z][a-zA-Z0-9&\-]+(?:\s+[A-Z][a-zA-Z0-9&\-]+){0,3})\b", text or "")
+    # Filtre bruits communs
+    bad = {"The","This","That","And","For","With","From","By","In","On","Of","At","An","A","To","As","It","Its","We","He","She"}
+    out, seen = [], set()
+    for c in cand:
+        if any(w in bad for w in c.split()):
+            continue
+        key = c.strip()
+        if len(key) < 3: 
+            continue
+        knorm = key.lower()
+        if knorm in seen: 
+            continue
+        seen.add(knorm)
+        out.append(key)
+        if len(out) >= max_items:
+            break
     return out
 
-# ---- Détection FR/EN + traduction secours
+def extract_signals(text: str) -> dict:
+    if not text:
+        return {"actors": [], "numbers": [], "dates": []}
+    actors = extract_actors(text)
+    nums = set(re.findall(MONEY, text, flags=re.IGNORECASE)) | set(re.findall(PCT, text))
+    # privilégie les montants/%, sinon quelques nombres nus
+    if len(nums) < 3:
+        nums |= set(re.findall(PLAIN_NUM, text))
+    # dates (mois + année, ou année seule)
+    dates = set(re.findall(MONTHS + r"\s+" + YEAR, text, flags=re.IGNORECASE))
+    years = set(re.findall(r"\b" + YEAR + r"\b", text))
+    # normalise
+    numbers = [n.strip() for n in list(nums) if n.strip()][:6]
+    dates_fmt = []
+    for d in list(dates):
+        if isinstance(d, tuple):
+            dates_fmt.append(" ".join(d).strip())
+        else:
+            dates_fmt.append(str(d).strip())
+    dates_fmt += [y for y in list(years) if y not in dates_fmt]
+    dates_fmt = dates_fmt[:6]
+    return {"actors": actors[:6], "numbers": numbers, "dates": dates_fmt}
+
+def make_fact_hints(signals: dict) -> str:
+    """Construit une petite section 'Faits détectés' à injecter dans le prompt."""
+    if not signals:
+        return ""
+    parts = []
+    if signals.get("actors"):
+        parts.append("Acteurs: " + ", ".join(signals["actors"][:4]))
+    if signals.get("numbers"):
+        parts.append("Chiffres: " + ", ".join(signals["numbers"][:4]))
+    if signals.get("dates"):
+        parts.append("Échéances: " + ", ".join(signals["dates"][:4]))
+    txt = " ; ".join(parts)
+    return (txt[:300] + "…") if len(txt) > 300 else txt
+
+def dedupe_lines(lines: list[str]) -> list[str]:
+    """Supprime les doublons ou quasi-doublons (normalisation simple)."""
+    out, seen = [], set()
+    for l in lines:
+        norm = re.sub(r"[\W_]+", " ", l.lower()).strip()
+        norm = re.sub(r"\s+", " ", norm)
+        if norm in seen or not norm:
+            continue
+        seen.add(norm)
+        out.append(l)
+    return out
+
+# ---- FR/EN + traduction secours
 def is_likely_english(txt: str) -> bool:
     if not txt:
         return False
@@ -117,19 +177,21 @@ def translate_to_fr(text: str) -> str:
 # =================
 # Résumé en français
 # =================
-def summarize_5_lines(context: str) -> str:
+def summarize_5_lines(context: str, fact_hints: str) -> str:
     prompt = (
         "Tu écris UNIQUEMENT en FRANÇAIS. Produis 4 à 5 puces courtes (≤ ~25 mots), "
         "ton posé, analytique, optimisme mesuré, orienté IA / spatial / innovation. "
         "Si disponibles, privilégie données chiffrées, noms d'acteurs, échéances. "
-        "Varie légèrement les tournures.\n"
+        "Varie légèrement les tournures. N'énonce PAS deux fois la même idée. "
+        "INTERDIT: copier mot à mot la source; reformule.\n"
         "Structure :\n- Fait marquant\n- Pourquoi c’est important\n- Implications (marché/technos)\n"
         "- Risque / point de vigilance\n- Prochaine étape / à surveiller\n\n"
+        f"Faits détectés (à intégrer si pertinents): {fact_hints}\n\n"
         f"{context[:4000]}"
     )
     payload = {
         "inputs": prompt,
-        "parameters": {"max_new_tokens": 220, "temperature": 0.7},
+        "parameters": {"max_new_tokens": 260, "temperature": 0.7},
         "options": {"wait_for_model": True}
     }
     out = ""
@@ -142,12 +204,14 @@ def summarize_5_lines(context: str) -> str:
         out = ""
 
     out = re.sub(r"\n{3,}", "\n\n", (out or "").strip())
-    lines = [l.strip(" -*•\t") for l in out.split("\n") if l.strip()]
+    raw_lines = [l.strip(" -*•\t") for l in out.split("\n") if l.strip()]
+    lines = dedupe_lines(raw_lines)
     if len(lines) < 4:
+        # fallback extractif sur le contexte riche
         lines = extractive_fallback(context, k=5)
     text = "\n".join(f"- {l}" for l in lines[:5])
 
-    # Garde-fou: si ça ressemble à de l’anglais, traduis en FR
+    # Garde-fou FR
     if is_likely_english(text):
         text = translate_to_fr(text)
     return text
@@ -226,16 +290,14 @@ def search_and_like(client: Client, cfg: dict) -> int:
     liked = 0
 
     for kw in keywords:
-        if liked >= max_likes:
-            break
+        if liked >= max_likes: break
         try:
             res = client.app.bsky.feed.search_posts({"q": kw, "limit": 10})
         except Exception:
             continue
         posts = res.get("posts", []) if isinstance(res, dict) else []
         for post in posts:
-            if liked >= max_likes:
-                break
+            if liked >= max_likes: break
             try:
                 author = post["author"]["handle"]
                 like_count = post.get("likeCount", 0) or 0
@@ -269,12 +331,11 @@ def maybe_follow_accounts(client: Client, cfg: dict) -> int:
     followed = 0
 
     for handle in whitelist:
-        if followed >= max_follows:
-            break
+        if followed >= max_follows: break
         try:
             profile = client.get_profile(handle)
             if profile.get("viewer", {}).get("following"):
-                continue  # déjà suivi
+                continue
             feed = client.get_author_feed(handle, {"limit": 5})
             has_recent = False
             for item in feed.get("feed", []):
@@ -308,18 +369,19 @@ def main():
 
     _, title, summary, link = best
     even_day = (date.today().toordinal() % 2 == 0)
-    include_link_main = bool(POSTING.get("include_link_in_main", False))     # post principal: par défaut sans lien
-    include_link_reply = bool(POSTING.get("include_link_in_reply", True))    # réponse "Source :" activée
+    include_link_main = bool(POSTING.get("include_link_in_main", False))   # post principal: par défaut sans lien
+    include_link_reply = bool(POSTING.get("include_link_in_reply", True))  # réponse "Source :" activée
 
     c = bsky_client()
 
     if even_day:
-        # Jour "éclairage" (FR, contexte riche)
-        context = build_context(title, summary, link)
-        wakeup = summarize_5_lines(context)
+        # Contexte riche + signaux
+        context, fulltext = build_context(title, summary, link)
+        signals = extract_signals(fulltext or context)
+        hints = make_fact_hints(signals)
+        wakeup = summarize_5_lines(context, hints)
         res = post_bsky(c, wakeup, link=link, include_link=include_link_main)
     else:
-        # Jour "repost/teaser" (FR)
         teaser = f"Lecture conseillée 👇 {title}"
         res = post_bsky(c, teaser, link=link, include_link=include_link_main)
 
