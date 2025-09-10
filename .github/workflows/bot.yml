@@ -1,0 +1,31 @@
+name: equinoxe-bot
+
+on:
+  schedule:
+    - cron: "30 08 * * *"  # 10:30 Europe/Brussels ~ 08:30 UTC (heure d'été). Ajuste selon saison.
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          pip install atproto feedparser requests beautifulsoup4 python-dateutil
+
+      - name: Run bot (analyse/repost alternés)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
+        run: |
+          python bot.py
