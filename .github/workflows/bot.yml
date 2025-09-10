@@ -2,7 +2,7 @@ name: equinoxe-bot
 
 on:
   schedule:
-    - cron: "30 08 * * *"  # 10:30 Europe/Brussels ~ 08:30 UTC (heure d'été). Ajuste selon saison.
+    - cron: "30 08 * * *"    # ~10:30 Europe/Brussels l'été
   workflow_dispatch: {}
 
 jobs:
@@ -18,14 +18,18 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install deps
+      - name: Debug (où suis-je ?)
         run: |
-          run: pip install -r requirements.txt
+          python -V || python3 -V
+          pwd
+          ls -la
+
+      - name: Install deps
+        run: pip install -r requirements.txt
 
       - name: Run bot (analyse/repost alternés)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
           BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
-        run: |
-          python bot.py
+        run: python bot.py
