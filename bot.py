@@ -3,6 +3,7 @@ import os, re, json, requests, feedparser
 from datetime import date, datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from atproto import Client
+from atproto.rich_text import RichText  # pour liens cliquables via facets
 
 # =======================
 # Chargement configuration
@@ -13,11 +14,13 @@ THRESH = CFG["score_threshold"]
 MAX_PER_FEED = CFG.get("max_items_per_feed", 12)
 SOURCES = CFG["sources"]
 SOCIAL = CFG.get("social_rules", {})
+POSTING = CFG.get("posting", {})
 
 # ===============
 # Hugging Face API
 # ===============
 HF_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+TRANS_URL = "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-en-fr"
 HF_HEADERS = {"Authorization": f"Bearer {os.environ.get('HF_TOKEN', '')}"}
 
 # =============
@@ -28,7 +31,7 @@ def clean_html(s: str) -> str:
     return BeautifulSoup(s or "", "html.parser").get_text(" ", strip=True)
 
 def strip_boilerplate(txt: str) -> str:
-    """Retire les signatures de flux du type 'The post ... appeared first on ...' et les trackers."""
+    """Retire les signatures de flux ('The post ... appeared first on ...') et les trackers."""
     if not txt:
         return ""
     txt = re.sub(r"The post .*? appeared first on .*?$", "", txt, flags=re.IGNORECASE | re.DOTALL)
@@ -72,9 +75,26 @@ def extractive_fallback(text: str, k=5):
         out = [ (text or "")[:200] or "Point clé à surveiller." ]
     return out
 
+# ---- Détection FR / EN + traduction secours
+def is_likely_english(txt: str) -> bool:
+    if not txt:
+        return False
+    en_markers = re.findall(r"\b(the|and|of|to|in|for|with|on|from|by|is|are|this|that|it|as)\b", txt.lower())
+    return len(en_markers) >= 3
+
+def translate_to_fr(text: str) -> str:
+    try:
+        r = requests.post(TRANS_URL, headers=HF_HEADERS, json={"inputs": text[:4000]}, timeout=45)
+        data = r.json()
+        if isinstance(data, list) and data and "translation_text" in data[0]:
+            return data[0]["translation_text"].strip()
+    except Exception:
+        pass
+    return text  # fallback
+
 def summarize_5_lines(title: str, summary: str) -> str:
     """
-    Produit exactement 4 à 5 puces en FR :
+    Produit 4–5 puces en FR :
     - Fait marquant
     - Pourquoi c’est important
     - Implications (marché/technos)
@@ -83,22 +103,20 @@ def summarize_5_lines(title: str, summary: str) -> str:
     """
     base = f"{title}. {summary}"
     prompt = (
-        "Tu écris UNIQUEMENT en FRANÇAIS, même si la source est en anglais. "
-        "Lis le texte et produis exactement 4 à 5 puces courtes (max ~25 mots chacune), "
-        "ton posé, analytique, optimisme mesuré, orienté IA / spatial / innovation.\n"
-        "Structure attendue :\n"
-        "- Fait marquant\n"
-        "- Pourquoi c’est important\n"
-        "- Implications (marché/technos)\n"
-        "- Risque ou point de vigilance\n"
-        "- Prochaine étape / à surveiller\n\n"
+        "Tu écris UNIQUEMENT en FRANÇAIS. "
+        "Produis 4 à 5 puces courtes (≤ ~25 mots), ton posé, analytique, optimisme mesuré, "
+        "orienté IA / spatial / innovation. Varie légèrement les tournures à chaque réponse.\n"
+        "Structure :\n"
+        "- Fait marquant\n- Pourquoi c’est important\n- Implications (marché/technos)\n"
+        "- Risque / point de vigilance\n- Prochaine étape / à surveiller\n\n"
         f"{base[:4000]}"
     )
     payload = {
         "inputs": prompt,
-        "parameters": {"max_new_tokens": 220},
+        "parameters": {"max_new_tokens": 220, "temperature": 0.7},
         "options": {"wait_for_model": True}
     }
+    out = ""
     try:
         r = requests.post(HF_URL, headers=HF_HEADERS, json=payload, timeout=90)
         r.raise_for_status()
@@ -109,11 +127,14 @@ def summarize_5_lines(title: str, summary: str) -> str:
 
     out = re.sub(r"\n{3,}", "\n\n", (out or "").strip())
     lines = [l.strip(" -*•\t") for l in out.split("\n") if l.strip()]
-    if len(lines) < 4:  # fallback FR si besoin
+    if len(lines) < 4:
         lines = extractive_fallback(summary, k=5)
-    # Couper à 5 lignes max et préfixer en puces
-    lines = lines[:5]
-    return "\n".join(f"- {l}" for l in lines)
+    text = "\n".join(f"- {l}" for l in lines[:5])
+
+    # Garde-fou: si ça ressemble à de l’anglais, traduis en FR
+    if is_likely_english(text):
+        text = translate_to_fr(text)
+    return text
 
 # =============
 # Bluesky client
@@ -128,14 +149,19 @@ def bsky_client() -> Client:
     return c
 
 def post_bsky(client: Client, text: str):
-    """Poste sur Bluesky en respectant ~300 caractères (teaser + lien)."""
+    """Poste sur Bluesky en respectant ~300 caractères et en rendant les liens cliquables (facets)."""
     if os.environ.get("DRY_RUN") == "1":
         print("[DRY_RUN] Aurait posté:\n", (text or "")[:295])
         return
     t = (text or "").strip()
     if len(t) > 295:
         t = t[:292].rstrip() + "…"
-    client.send_post(text=t)
+    rt = RichText(t)
+    try:
+        rt.detect_facets(client)  # URLs/mentions -> facets cliquables
+    except Exception:
+        pass
+    client.send_post(text=rt.text, facets=rt.facets)
 
 # ==========================
 # Actions sociales (optionnel)
@@ -232,23 +258,25 @@ def main():
 
     best = pick_best_item()
     if not best:
-        # Rien d'assez pertinent aujourd'hui : sortie rapide (économise les minutes)
         print("Aucun item au-dessus du seuil, fin du run.")
         return
 
     _, title, summary, link = best
     even_day = (date.today().toordinal() % 2 == 0)
+    include_link = bool(POSTING.get("include_link_in_main", True))
 
     c = bsky_client()
 
     if even_day:
         # Jour "éclairage" (IA en FR)
         wakeup = summarize_5_lines(title, summary)
-        post_bsky(c, f"{wakeup}\n{link}")
+        text = f"{wakeup}\n{link}" if include_link and link else wakeup
+        post_bsky(c, text)
     else:
         # Jour "repost/teaser" (FR)
         teaser = f"Lecture conseillée 👇 {title}"
-        post_bsky(c, f"{teaser}\n{link}")
+        text = f"{teaser}\n{link}" if include_link and link else teaser
+        post_bsky(c, text)
 
     # Actions sociales légères (facultatif)
     try:
