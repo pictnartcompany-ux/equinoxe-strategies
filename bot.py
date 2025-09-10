@@ -2,8 +2,7 @@
 import os, re, json, requests, feedparser
 from datetime import date, datetime, timezone, timedelta
 from bs4 import BeautifulSoup
-from atproto import Client
-from atproto.rich_text import RichText  # pour liens cliquables via facets
+from atproto import Client, models  
 
 # =======================
 # Chargement configuration
@@ -27,11 +26,9 @@ HF_HEADERS = {"Authorization": f"Bearer {os.environ.get('HF_TOKEN', '')}"}
 # Utilitaires
 # =============
 def clean_html(s: str) -> str:
-    """Supprime les balises HTML et normalise l'espace."""
     return BeautifulSoup(s or "", "html.parser").get_text(" ", strip=True)
 
 def strip_boilerplate(txt: str) -> str:
-    """Retire les signatures de flux ('The post ... appeared first on ...') et les trackers."""
     if not txt:
         return ""
     txt = re.sub(r"The post .*? appeared first on .*?$", "", txt, flags=re.IGNORECASE | re.DOTALL)
@@ -39,12 +36,10 @@ def strip_boilerplate(txt: str) -> str:
     return txt.strip()
 
 def score(text: str) -> int:
-    """Score par mots-clés selon les convictions."""
     t = (text or "").lower()
     return sum(w for k, w in BELIEFS.items() if k in t)
 
 def pick_best_item():
-    """Parcourt les flux et retourne le meilleur item au-dessus du seuil."""
     items = []
     for url in SOURCES:
         feed = feedparser.parse(url)
@@ -62,7 +57,6 @@ def pick_best_item():
     return best if best[0] >= THRESH else None
 
 def extractive_fallback(text: str, k=5):
-    """Fallback simple: sélectionne 4–5 phrases informatives si le modèle IA répond mal."""
     sents = re.split(r"(?<=[.!?])\s+", text or "")
     scored = []
     for s in sents:
@@ -75,7 +69,7 @@ def extractive_fallback(text: str, k=5):
         out = [ (text or "")[:200] or "Point clé à surveiller." ]
     return out
 
-# ---- Détection FR / EN + traduction secours
+# ---- FR/EN + traduction secours
 def is_likely_english(txt: str) -> bool:
     if not txt:
         return False
@@ -90,17 +84,9 @@ def translate_to_fr(text: str) -> str:
             return data[0]["translation_text"].strip()
     except Exception:
         pass
-    return text  # fallback
+    return text
 
 def summarize_5_lines(title: str, summary: str) -> str:
-    """
-    Produit 4–5 puces en FR :
-    - Fait marquant
-    - Pourquoi c’est important
-    - Implications (marché/technos)
-    - Risque / point de vigilance
-    - Prochaine étape / à surveiller
-    """
     base = f"{title}. {summary}"
     prompt = (
         "Tu écris UNIQUEMENT en FRANÇAIS. "
@@ -131,7 +117,6 @@ def summarize_5_lines(title: str, summary: str) -> str:
         lines = extractive_fallback(summary, k=5)
     text = "\n".join(f"- {l}" for l in lines[:5])
 
-    # Garde-fou: si ça ressemble à de l’anglais, traduis en FR
     if is_likely_english(text):
         text = translate_to_fr(text)
     return text
@@ -148,20 +133,32 @@ def bsky_client() -> Client:
     c.login(handle, pwd)
     return c
 
-def post_bsky(client: Client, text: str):
-    """Poste sur Bluesky en respectant ~300 caractères et en rendant les liens cliquables (facets)."""
+def post_bsky(client: Client, text: str, link: str | None = None, include_link: bool = False):
+    """Poste sur Bluesky (texte seul par défaut). Option: embed externe pour un lien cliquable, sans RichText."""
     if os.environ.get("DRY_RUN") == "1":
-        print("[DRY_RUN] Aurait posté:\n", (text or "")[:295])
+        preview = text if len(text) <= 295 else (text[:292].rstrip() + "…")
+        print("[DRY_RUN] Aurait posté:\n", preview, "\nLINK:", link if include_link else "(none)")
         return
+
     t = (text or "").strip()
     if len(t) > 295:
         t = t[:292].rstrip() + "…"
-    rt = RichText(t)
-    try:
-        rt.detect_facets(client)  # URLs/mentions -> facets cliquables
-    except Exception:
-        pass
-    client.send_post(text=rt.text, facets=rt.facets)
+
+    embed = None
+    # Si tu veux des liens cliquables plus tard, passe include_link=True
+    if include_link and link:
+        try:
+            embed = models.AppBskyEmbedExternal.Main(
+                external=models.AppBskyEmbedExternal.External(
+                    uri=link,
+                    title="Source",
+                    description="Lien externe"
+                )
+            )
+        except Exception:
+            embed = None
+
+    client.send_post(text=t, embed=embed)
 
 # ==========================
 # Actions sociales (optionnel)
@@ -228,7 +225,7 @@ def maybe_follow_accounts(client: Client, cfg: dict) -> int:
         try:
             profile = client.get_profile(handle)
             if profile.get("viewer", {}).get("following"):
-                continue  # déjà suivi
+                continue
             feed = client.get_author_feed(handle, {"limit": 5})
             has_recent = False
             for item in feed.get("feed", []):
@@ -252,7 +249,6 @@ def maybe_follow_accounts(client: Client, cfg: dict) -> int:
 # Main
 # =====
 def main():
-    # Secrets requis
     if not os.environ.get("HF_TOKEN"):
         raise SystemExit("Missing HF_TOKEN")
 
@@ -263,22 +259,19 @@ def main():
 
     _, title, summary, link = best
     even_day = (date.today().toordinal() % 2 == 0)
-    include_link = bool(POSTING.get("include_link_in_main", True))
+    include_link = bool(POSTING.get("include_link_in_main", False))  # par défaut: pas de lien pour “faire opinion”
 
     c = bsky_client()
 
     if even_day:
-        # Jour "éclairage" (IA en FR)
         wakeup = summarize_5_lines(title, summary)
-        text = f"{wakeup}\n{link}" if include_link and link else wakeup
-        post_bsky(c, text)
+        text = wakeup  # on laisse propre, sans URL en corps
+        post_bsky(c, text, link=link, include_link=include_link)
     else:
-        # Jour "repost/teaser" (FR)
         teaser = f"Lecture conseillée 👇 {title}"
-        text = f"{teaser}\n{link}" if include_link and link else teaser
-        post_bsky(c, text)
+        text = teaser
+        post_bsky(c, text, link=link, include_link=include_link)
 
-    # Actions sociales légères (facultatif)
     try:
         liked = search_and_like(c, CFG)
         followed = maybe_follow_accounts(c, CFG)
