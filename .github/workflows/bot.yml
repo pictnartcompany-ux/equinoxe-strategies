@@ -20,7 +20,7 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install atproto feedparser requests beautifulsoup4 python-dateutil
+          run: pip install -r requirements.txt
 
       - name: Run bot (analyse/repost alternés)
         env:
