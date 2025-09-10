@@ -20,7 +20,8 @@
   ],
 
   "posting": {
-    "include_link_in_main": false
+    "include_link_in_main": false,
+    "include_link_in_reply": true
   },
 
   "social_rules": {
