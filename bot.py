@@ -2,7 +2,7 @@
 import os, re, json, requests, feedparser
 from datetime import date, datetime, timezone, timedelta
 from bs4 import BeautifulSoup
-from atproto import Client, models  
+from atproto import Client, models  # pas de RichText (compat large)
 
 # =======================
 # Chargement configuration
@@ -26,9 +26,11 @@ HF_HEADERS = {"Authorization": f"Bearer {os.environ.get('HF_TOKEN', '')}"}
 # Utilitaires
 # =============
 def clean_html(s: str) -> str:
+    """Supprime les balises HTML et normalise l'espace."""
     return BeautifulSoup(s or "", "html.parser").get_text(" ", strip=True)
 
 def strip_boilerplate(txt: str) -> str:
+    """Retire les signatures RSS du type 'The post ... appeared first on ...' et les trackers."""
     if not txt:
         return ""
     txt = re.sub(r"The post .*? appeared first on .*?$", "", txt, flags=re.IGNORECASE | re.DOTALL)
@@ -36,10 +38,12 @@ def strip_boilerplate(txt: str) -> str:
     return txt.strip()
 
 def score(text: str) -> int:
+    """Score par mots-clés selon les convictions."""
     t = (text or "").lower()
     return sum(w for k, w in BELIEFS.items() if k in t)
 
 def pick_best_item():
+    """Parcourt les flux et retourne le meilleur item au-dessus du seuil."""
     items = []
     for url in SOURCES:
         feed = feedparser.parse(url)
@@ -56,7 +60,31 @@ def pick_best_item():
     best = items[0]
     return best if best[0] >= THRESH else None
 
+def fetch_article_text(url: str) -> str:
+    """Récupère le corps de l'article pour donner de la matière à l'IA."""
+    if not url:
+        return ""
+    try:
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        text = " ".join(ps)
+        return text[:4000]
+    except Exception:
+        return ""
+
+def build_context(title: str, summary: str, link: str) -> str:
+    """Construit un contexte riche (titre+résumé+article) pour de meilleurs résumés."""
+    article = fetch_article_text(link)
+    base = f"{title}. {summary}".strip()
+    ctx = (base + "\n\n" + article).strip()
+    return ctx[:4000] if ctx else base[:1000]
+
 def extractive_fallback(text: str, k=5):
+    """Fallback: sélectionne 4–5 phrases informatives si l'IA répond mal."""
     sents = re.split(r"(?<=[.!?])\s+", text or "")
     scored = []
     for s in sents:
@@ -66,10 +94,10 @@ def extractive_fallback(text: str, k=5):
     scored.sort(key=lambda x: x[0], reverse=True)
     out = [s for _, s in scored[:k]]
     if not out:
-        out = [ (text or "")[:200] or "Point clé à surveiller." ]
+        out = [(text or "")[:200] or "Point clé à surveiller."]
     return out
 
-# ---- FR/EN + traduction secours
+# ---- Détection FR/EN + traduction secours
 def is_likely_english(txt: str) -> bool:
     if not txt:
         return False
@@ -84,10 +112,12 @@ def translate_to_fr(text: str) -> str:
             return data[0]["translation_text"].strip()
     except Exception:
         pass
-    return text
+    return text  # fallback
 
-def summarize_5_lines(title: str, summary: str) -> str:
-    base = f"{title}. {summary}"
+# =================
+# Résumé en français
+# =================
+def summarize_5_lines(context: str) -> str:
     prompt = (
         "Tu écris UNIQUEMENT en FRANÇAIS. Produis 4 à 5 puces courtes (≤ ~25 mots), "
         "ton posé, analytique, optimisme mesuré, orienté IA / spatial / innovation. "
@@ -95,7 +125,7 @@ def summarize_5_lines(title: str, summary: str) -> str:
         "Varie légèrement les tournures.\n"
         "Structure :\n- Fait marquant\n- Pourquoi c’est important\n- Implications (marché/technos)\n"
         "- Risque / point de vigilance\n- Prochaine étape / à surveiller\n\n"
-        f"{base[:4000]}"
+        f"{context[:4000]}"
     )
     payload = {
         "inputs": prompt,
@@ -114,9 +144,10 @@ def summarize_5_lines(title: str, summary: str) -> str:
     out = re.sub(r"\n{3,}", "\n\n", (out or "").strip())
     lines = [l.strip(" -*•\t") for l in out.split("\n") if l.strip()]
     if len(lines) < 4:
-        lines = extractive_fallback(summary, k=5)
+        lines = extractive_fallback(context, k=5)
     text = "\n".join(f"- {l}" for l in lines[:5])
 
+    # Garde-fou: si ça ressemble à de l’anglais, traduis en FR
     if is_likely_english(text):
         text = translate_to_fr(text)
     return text
@@ -134,10 +165,10 @@ def bsky_client() -> Client:
     return c
 
 def post_bsky(client: Client, text: str, link: str | None = None, include_link: bool = False):
-    """Poste et retourne l'objet post créé (dict avec uri/cid). Si include_link, ajoute une carte cliquable."""
+    """Poste et retourne l'objet {'uri','cid'} du post créé. Si include_link, ajoute une carte cliquable."""
     if os.environ.get("DRY_RUN") == "1":
         preview = text if len(text) <= 295 else (text[:292].rstrip() + "…")
-        print("[DRY_RUN] Aurait posté:\n", preview, "\nLINK:", link if include_link else "(none)")
+        print("[DRY_RUN] POST:", preview, "| LINK:", link if include_link else "(none)")
         return None
 
     t = (text or "").strip()
@@ -149,30 +180,34 @@ def post_bsky(client: Client, text: str, link: str | None = None, include_link: 
         try:
             embed = models.AppBskyEmbedExternal.Main(
                 external=models.AppBskyEmbedExternal.External(
-                    uri=link, title="Source", description="Lien externe"
+                    uri=link, title="Source", description=""
                 )
             )
-        except Exception:
+        except Exception as e:
+            print("[WARN] embed externe KO:", e)
             embed = None
 
     return client.send_post(text=t, embed=embed)
 
 def reply_with_link_card(client: Client, parent_post: dict, link: str):
-    """Répond au post parent avec une carte cliquable 'Source :'."""
+    """Répond au post parent avec une carte 'Source :', en dict brut (compat large)."""
     if not parent_post or not link:
+        print("[INFO] Pas de parent ou pas de lien pour reply.")
         return
     try:
         embed = models.AppBskyEmbedExternal.Main(
             external=models.AppBskyEmbedExternal.External(
-                uri=link, title="Source", description="Lien externe"
+                uri=link, title="Source", description=""
             )
         )
-        # Construire une référence forte au post parent (uri/cid)
-        parent_ref = models.create_strong_ref(parent_post["uri"], parent_post["cid"])
-        reply_ref = models.AppBskyFeedPost.ReplyRef(parent=parent_ref, root=parent_ref)
+        reply_ref = {
+            "root": {"uri": parent_post["uri"], "cid": parent_post["cid"]},
+            "parent": {"uri": parent_post["uri"], "cid": parent_post["cid"]},
+        }
         client.send_post(text="Source :", embed=embed, reply_to=reply_ref)
-    except Exception:
-        pass
+        print("[OK] Reply Source posté.")
+    except Exception as e:
+        print("[ERROR] Reply Source KO:", e)
 
 # ==========================
 # Actions sociales (optionnel)
@@ -239,7 +274,7 @@ def maybe_follow_accounts(client: Client, cfg: dict) -> int:
         try:
             profile = client.get_profile(handle)
             if profile.get("viewer", {}).get("following"):
-                continue
+                continue  # déjà suivi
             feed = client.get_author_feed(handle, {"limit": 5})
             has_recent = False
             for item in feed.get("feed", []):
@@ -273,14 +308,15 @@ def main():
 
     _, title, summary, link = best
     even_day = (date.today().toordinal() % 2 == 0)
-    include_link_main = bool(POSTING.get("include_link_in_main", False))
-    include_link_reply = bool(POSTING.get("include_link_in_reply", True))
+    include_link_main = bool(POSTING.get("include_link_in_main", False))     # post principal: par défaut sans lien
+    include_link_reply = bool(POSTING.get("include_link_in_reply", True))    # réponse "Source :" activée
 
     c = bsky_client()
 
     if even_day:
-        # Jour "éclairage" (FR)
-        wakeup = summarize_5_lines(title, summary)
+        # Jour "éclairage" (FR, contexte riche)
+        context = build_context(title, summary, link)
+        wakeup = summarize_5_lines(context)
         res = post_bsky(c, wakeup, link=link, include_link=include_link_main)
     else:
         # Jour "repost/teaser" (FR)
