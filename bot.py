@@ -87,6 +87,21 @@ PCT = r"\b\d{1,3}(?:[.,]\d+)?\s?%\b"
 MONEY = r"(?:\$|€)\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?\s?(?:bn|billion|milliard|milliards|m|million|millions|k)?"
 PLAIN_NUM = r"\b\d{2,4}(?:[.,]\d+)?\b"
 
+def extractive_fallback(text: str, k=5):
+    """Fallback: sélectionne 4–5 phrases informatives si l'IA répond mal."""
+    sents = re.split(r"(?<=[.!?])\s+", text or "")
+    scored = []
+    for s in sents:
+        sl = s.strip()
+        if 40 <= len(sl) <= 240:
+            scored.append((score(sl) + min(len(sl)//60, 3), sl))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out = [s for _, s in scored[:k]]
+    if not out:
+        out = [(text or "")[:200] or "Point clé à surveiller."]
+    return out
+
+
 def extract_actors(text: str, max_items=6):
     # Séquences de mots Capitalisés (2 à 4), filtre basique
     cand = re.findall(r"\b([A-Z][a-zA-Z0-9&\-]+(?:\s+[A-Z][a-zA-Z0-9&\-]+){0,3})\b", text or "")
