@@ -1,45 +1,38 @@
-{
-  "belief_weights": {
-    "space": 3, "spatial": 3, "ariane": 3, "avio": 3, "esa": 2,
-    "launcher": 2, "rocket": 2, "satellite": 2, "orbit": 2,
-    "ai": 2, "intelligence artificielle": 2, "machine learning": 2,
-    "semiconductor": 2, "chip": 2, "gpu": 2, "nvidia": 2, "amd": 1, "tsmc": 1, "foundry": 1, "hbm": 1,
-    "innovation": 1, "startup": 1, "marché": 1, "market": 1, "macro": 1, "inflation": 1,
-    "économie": 1, "economy": 1,
-    "crypto": 1, "bitcoin": 1, "ethereum": 1, "blockchain": 1, "nft": 1, "token": 1
-  },
+name: equinoxe-bot
 
-  "score_threshold": 3,
-  "max_items_per_feed": 12,
+on:
+  schedule:
+    - cron: "30 08 * * *"  # ~10:30 Europe/Brussels (été)
+  workflow_dispatch: {}
 
-  "sources": [
-    "https://spacenews.com/feed/",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://techcrunch.com/feed/",
-    "https://www.economist.com/finance-and-economics/rss.xml"
-  ],
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-  "posting": {
-    "include_link_in_main": false
-  },
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-  "social_rules": {
-    "enable_likes": false,
-    "enable_follows": false,
-    "accounts_whitelist": [
-      "esa.bsky.social",
-      "arianespace.bsky.social",
-      "coindesk.bsky.social",
-      "techcrunch.bsky.social"
-    ],
-    "keywords_for_social": [
-      "space", "ariane", "esa", "satellite",
-      "ai", "semiconductor", "gpu", "nvidia",
-      "crypto", "bitcoin", "blockchain"
-    ],
-    "max_likes_per_run": 1,
-    "max_follows_per_run": 0,
-    "min_engagement_like": 5,
-    "follow_only_if_posted_recently_hours": 72
-  }
-}
+      - name: Install deps
+        run: pip install atproto feedparser requests beautifulsoup4 python-dateutil
+
+      # Option: activer DRY_RUN=1 pour tester sans publier
+      # - name: Run bot (dry-run)
+      #   env:
+      #     HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      #     BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+      #     BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
+      #     DRY_RUN: "1"
+      #   run: python bot.py
+
+      - name: Run bot (analyse/repost alternés)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
+        run: python bot.py
