@@ -89,11 +89,11 @@ def translate_to_fr(text: str) -> str:
 def summarize_5_lines(title: str, summary: str) -> str:
     base = f"{title}. {summary}"
     prompt = (
-        "Tu écris UNIQUEMENT en FRANÇAIS. "
-        "Produis 4 à 5 puces courtes (≤ ~25 mots), ton posé, analytique, optimisme mesuré, "
-        "orienté IA / spatial / innovation. Varie légèrement les tournures à chaque réponse.\n"
-        "Structure :\n"
-        "- Fait marquant\n- Pourquoi c’est important\n- Implications (marché/technos)\n"
+        "Tu écris UNIQUEMENT en FRANÇAIS. Produis 4 à 5 puces courtes (≤ ~25 mots), "
+        "ton posé, analytique, optimisme mesuré, orienté IA / spatial / innovation. "
+        "Si disponibles, privilégie données chiffrées, noms d'acteurs, échéances. "
+        "Varie légèrement les tournures.\n"
+        "Structure :\n- Fait marquant\n- Pourquoi c’est important\n- Implications (marché/technos)\n"
         "- Risque / point de vigilance\n- Prochaine étape / à surveiller\n\n"
         f"{base[:4000]}"
     )
@@ -122,7 +122,7 @@ def summarize_5_lines(title: str, summary: str) -> str:
     return text
 
 # =============
-# Bluesky client
+# Bluesky client + post / reply
 # =============
 def bsky_client() -> Client:
     handle = os.environ.get("BSKY_HANDLE")
@@ -134,31 +134,45 @@ def bsky_client() -> Client:
     return c
 
 def post_bsky(client: Client, text: str, link: str | None = None, include_link: bool = False):
-    """Poste sur Bluesky (texte seul par défaut). Option: embed externe pour un lien cliquable, sans RichText."""
+    """Poste et retourne l'objet post créé (dict avec uri/cid). Si include_link, ajoute une carte cliquable."""
     if os.environ.get("DRY_RUN") == "1":
         preview = text if len(text) <= 295 else (text[:292].rstrip() + "…")
         print("[DRY_RUN] Aurait posté:\n", preview, "\nLINK:", link if include_link else "(none)")
-        return
+        return None
 
     t = (text or "").strip()
     if len(t) > 295:
         t = t[:292].rstrip() + "…"
 
     embed = None
-    # Si tu veux des liens cliquables plus tard, passe include_link=True
     if include_link and link:
         try:
             embed = models.AppBskyEmbedExternal.Main(
                 external=models.AppBskyEmbedExternal.External(
-                    uri=link,
-                    title="Source",
-                    description="Lien externe"
+                    uri=link, title="Source", description="Lien externe"
                 )
             )
         except Exception:
             embed = None
 
-    client.send_post(text=t, embed=embed)
+    return client.send_post(text=t, embed=embed)
+
+def reply_with_link_card(client: Client, parent_post: dict, link: str):
+    """Répond au post parent avec une carte cliquable 'Source :'."""
+    if not parent_post or not link:
+        return
+    try:
+        embed = models.AppBskyEmbedExternal.Main(
+            external=models.AppBskyEmbedExternal.External(
+                uri=link, title="Source", description="Lien externe"
+            )
+        )
+        # Construire une référence forte au post parent (uri/cid)
+        parent_ref = models.create_strong_ref(parent_post["uri"], parent_post["cid"])
+        reply_ref = models.AppBskyFeedPost.ReplyRef(parent=parent_ref, root=parent_ref)
+        client.send_post(text="Source :", embed=embed, reply_to=reply_ref)
+    except Exception:
+        pass
 
 # ==========================
 # Actions sociales (optionnel)
@@ -259,19 +273,25 @@ def main():
 
     _, title, summary, link = best
     even_day = (date.today().toordinal() % 2 == 0)
-    include_link = bool(POSTING.get("include_link_in_main", False))  # par défaut: pas de lien pour “faire opinion”
+    include_link_main = bool(POSTING.get("include_link_in_main", False))
+    include_link_reply = bool(POSTING.get("include_link_in_reply", True))
 
     c = bsky_client()
 
     if even_day:
+        # Jour "éclairage" (FR)
         wakeup = summarize_5_lines(title, summary)
-        text = wakeup  # on laisse propre, sans URL en corps
-        post_bsky(c, text, link=link, include_link=include_link)
+        res = post_bsky(c, wakeup, link=link, include_link=include_link_main)
     else:
+        # Jour "repost/teaser" (FR)
         teaser = f"Lecture conseillée 👇 {title}"
-        text = teaser
-        post_bsky(c, text, link=link, include_link=include_link)
+        res = post_bsky(c, teaser, link=link, include_link=include_link_main)
 
+    # Publier la source en réponse (carte cliquable)
+    if include_link_reply and link and res:
+        reply_with_link_card(c, res, link)
+
+    # Social léger (optionnel)
     try:
         liked = search_and_like(c, CFG)
         followed = maybe_follow_accounts(c, CFG)
