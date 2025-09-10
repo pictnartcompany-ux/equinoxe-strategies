@@ -25,7 +25,7 @@
   },
 
   "social_rules": {
-    "enable_likes": false,
+    "enable_likes": true,
     "enable_follows": false,
     "accounts_whitelist": [
       "esa.bsky.social",
