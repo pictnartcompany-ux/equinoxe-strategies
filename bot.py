@@ -1,4 +1,11 @@
-# Requirements: pip install atproto feedparser requests beautifulsoup4 python-dateutil
+# coding: utf-8
+# equinoxe_strategie.py — version complète refondue avec diversité + mémoire
+
+# =========================
+# Dépendances (requirements)
+# =========================
+# pip install atproto feedparser requests beautifulsoup4 python-dateutil
+
 import os, re, json, requests, feedparser
 from datetime import date, datetime, timezone, timedelta
 from bs4 import BeautifulSoup
@@ -9,12 +16,21 @@ from difflib import SequenceMatcher
 # Chargement configuration
 # =======================
 CFG = json.load(open("config.json", "r", encoding="utf-8"))
+
 BELIEFS = CFG["belief_weights"]
 THRESH = CFG["score_threshold"]
 MAX_PER_FEED = CFG.get("max_items_per_feed", 12)
 SOURCES = CFG["sources"]
 SOCIAL = CFG.get("social_rules", {})
 POSTING = CFG.get("posting", {})
+
+# ---- Nouvelles clés (avec défauts sûrs)
+HISTORY_FILE = CFG.get("history_file", "history.json")
+HISTORY_DAYS = int(CFG.get("history_days", 10))
+TOP_K_SAMPLE = int(CFG.get("top_k_sample", 5))
+DIVERSITY_PENALTY = float(CFG.get("diversity_penalty", 0.12))
+SIM_TITLE_THRESH = float(CFG.get("sim_title_thresh", 0.78))
+RECENCY_HALF_LIFE_D = float(CFG.get("recency_half_life_days", 5))
 
 # ===============
 # Hugging Face API
@@ -40,23 +56,154 @@ def score(text: str) -> int:
     t = (text or "").lower()
     return sum(w for k, w in BELIEFS.items() if k in t)
 
+# ============
+# Historique
+# ============
+def load_history():
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)
+    out = []
+    for it in data:
+        try:
+            ts = datetime.fromisoformat(it["ts"])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts >= cutoff:
+                out.append(it)
+        except Exception:
+            pass
+    return out
+
+def save_history(items):
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def remember_post(link: str, title: str):
+    hist = load_history()
+    hist.append({"link": link, "title": title, "ts": datetime.now(timezone.utc).isoformat()})
+    seen = set()
+    dedup = []
+    for it in reversed(hist):
+        key = (it.get("link") or "").strip() or (it.get("title") or "").strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(it)
+    save_history(list(reversed(dedup)))
+
+def get_domain(url: str) -> str:
+    try:
+        return re.sub(r"^www\.", "", requests.utils.urlparse(url).netloc.lower())
+    except Exception:
+        return ""
+
+# ==============
+# Parsing feeds
+# ==============
+def _entry_dt(e) -> datetime:
+    for k in ("published_parsed", "updated_parsed"):
+        dtp = getattr(e, k, None)
+        if dtp:
+            try:
+                return datetime(*dtp[:6], tzinfo=timezone.utc)
+            except Exception:
+                pass
+    # Si pas de date, considère vieux (pénalise)
+    return datetime.now(timezone.utc) - timedelta(days=365)
+
+def _title_sim(a: str, b: str) -> float:
+    na = re.sub(r"\W+", " ", (a or "").lower()).strip()
+    nb = re.sub(r"\W+", " ", (b or "").lower()).strip()
+    if not na or not nb:
+        return 0.0
+    return SequenceMatcher(None, na, nb).ratio()
+
 def pick_best_item():
-    items = []
+    """Sélection diversité + fraîcheur + filtre anti-redite."""
+    import math, random
+
+    hist = load_history()
+    hist_links = {(h.get("link") or "").strip() for h in hist}
+    hist_titles = [h.get("title", "") for h in hist]
+
+    domain_recent_counts = {}
+    for h in hist:
+        d = get_domain(h.get("link", ""))
+        if not d:
+            continue
+        domain_recent_counts[d] = domain_recent_counts.get(d, 0) + 1
+
+    items_all = []
+    now = datetime.now(timezone.utc)
+
     for url in SOURCES:
         feed = feedparser.parse(url)
         for e in feed.entries[:MAX_PER_FEED]:
-            title = e.title or ""
+            title = getattr(e, "title", "") or ""
             summary_raw = clean_html(getattr(e, "summary", ""))
             summary = strip_boilerplate(summary_raw)
-            s = score(f"{title} {summary}")
             link = getattr(e, "link", "") or ""
-            items.append((s, title, summary, link))
-    if not items:
-        return None
-    items.sort(key=lambda x: x[0], reverse=True)
-    best = items[0]
-    return best if best[0] >= THRESH else None
+            if not title and not summary:
+                continue
 
+            # Exclusions (déjà posté / titres trop proches)
+            if link and link in hist_links:
+                continue
+            if any(_title_sim(title, ht) >= SIM_TITLE_THRESH for ht in hist_titles if ht):
+                continue
+
+            s_base = score(f"{title} {summary}")
+            dt = _entry_dt(e)
+            age_days = max(0.0, (now - dt).total_seconds() / 86400.0)
+            rec_boost = 1.0 * (2 ** (-age_days / max(RECENCY_HALF_LIFE_D, 0.1)))
+            dom = get_domain(link)
+            diversity_pen = DIVERSITY_PENALTY * domain_recent_counts.get(dom, 0)
+            combined = s_base + 3.0 * rec_boost - diversity_pen
+
+            items_all.append({
+                "score": combined,
+                "base": s_base,
+                "rec": rec_boost,
+                "pen": diversity_pen,
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "dt": dt,
+                "domain": dom,
+            })
+
+    if not items_all:
+        return None
+
+    # Tri + échantillonnage pondéré dans le Top-K
+    items_all.sort(key=lambda x: (x["score"], x["dt"]), reverse=True)
+    top = items_all[:max(1, TOP_K_SAMPLE)]
+    m = max(it["score"] for it in top)
+    weights = [math.exp((it["score"] - m) / 2.0) for it in top]  # température 2.0
+    tot = sum(weights) or 1.0
+    r = random.random() * tot
+    acc = 0.0
+    pick = top[0]
+    for it, w in zip(top, weights):
+        acc += w
+        if r <= acc:
+            pick = it
+            break
+
+    if pick["base"] < THRESH:
+        return None
+    return (pick["score"], pick["title"], pick["summary"], pick["link"])
+
+# ======================
+# Récup du texte article
+# ======================
 def fetch_article_text(url: str) -> str:
     if not url:
         return ""
@@ -79,6 +226,9 @@ def build_context(title: str, summary: str, link: str) -> tuple[str, str]:
     ctx = ctx[:4000] if ctx else base[:1000]
     return ctx, article
 
+# ============================
+# Extractive fallback & outils
+# ============================
 def extractive_fallback(text: str, k=5):
     sents = re.split(r"(?<=[.!?])\s+", text or "")
     scored = []
@@ -235,13 +385,11 @@ def _gen_bullets(context: str, fact_hints: str, strict: bool) -> list[str]:
     return raw
 
 def summarize_5_lines(context: str, fact_hints: str) -> str:
-    head = (context or "")[:400]  # zone où se trouve souvent la phrase d'ouverture
-    # 1ère passe
+    head = (context or "")[:400]
     raw_lines = _gen_bullets(context, fact_hints, strict=False)
     lines = dedupe_lines(raw_lines)
     lines = filter_copies(lines, head)
 
-    # Si trop proche/maigre, 2e passe plus stricte
     if len(lines) < 4 or any(too_similar(l, head) for l in lines):
         raw_lines2 = _gen_bullets(context, fact_hints, strict=True)
         lines2 = filter_copies(dedupe_lines(raw_lines2), head)
@@ -257,7 +405,7 @@ def summarize_5_lines(context: str, fact_hints: str) -> str:
     return text
 
 # =============
-# Bluesky client + anti-redite cross-jour
+# Bluesky client
 # =============
 def bsky_client() -> Client:
     handle = os.environ.get("BSKY_HANDLE")
@@ -275,7 +423,6 @@ def already_posted_recently(client: Client, link: str, self_handle: str, lookbac
         for item in feed.get("feed", []):
             rec = item.get("post", {}).get("record", {})
             txt = (rec.get("text") or "").strip()
-            # Regarde aussi dans les embeds des réponses "Source :" précédentes
             if link and link in txt:
                 return True
             embed = item.get("post", {}).get("embed", {})
@@ -290,7 +437,7 @@ def post_bsky(client: Client, text: str, link: str | None = None, include_link: 
     if os.environ.get("DRY_RUN") == "1":
         preview = text if len(text) <= 295 else (text[:292].rstrip() + "…")
         print("[DRY_RUN] POST:", preview, "| LINK:", link if include_link else "(none)")
-        return None
+        return {"uri": "dryrun://post", "cid": "dryrun"}  # faux post pour la suite
     t = (text or "").strip()
     if len(t) > 295:
         t = t[:292].rstrip() + "…"
@@ -409,7 +556,7 @@ def main():
 
     best = pick_best_item()
     if not best:
-        print("Aucun item au-dessus du seuil, fin du run.")
+        print("Aucun item au-dessus du seuil (ou tous vus/répétés), fin du run.")
         return
 
     _, title, summary, link = best
@@ -419,17 +566,17 @@ def main():
 
     c = bsky_client()
 
-    # Anti-redite cross-jour: ne pas reposter le même lien récemment
+    # 2e ceinture anti-redite via Bluesky
     if link and already_posted_recently(c, link, os.environ.get("BSKY_HANDLE", ""), lookback=25):
-        print("Lien déjà posté récemment — on saute ce run.")
+        print("Lien déjà posté récemment (Bluesky) — on saute ce run.")
         return
 
+    # Construction du contenu
     if even_day:
         context, fulltext = build_context(title, summary, link)
         signals = extract_signals(fulltext or context)
         hints = make_fact_hints(signals)
 
-        # Si article très pauvre ET aucun signal -> mieux vaut s'abstenir
         if (len((fulltext or "")) < 800) and (not signals["actors"] and not signals["numbers"]):
             print("Article pauvre (peu de matière). Sortie sans poster.")
             return
@@ -440,9 +587,15 @@ def main():
         teaser = f"Lecture conseillée 👇 {title}"
         res = post_bsky(c, teaser, link=link, include_link=include_link_main)
 
+    # Mémoriser si posté (y compris DRY_RUN)
+    posted = bool(res) or os.environ.get("DRY_RUN") == "1"
+    if posted and link:
+        remember_post(link, title)
+
     if include_link_reply and link and res:
         reply_with_link_card(c, res, link)
 
+    # Actions sociales
     try:
         liked = search_and_like(c, CFG)
         followed = maybe_follow_accounts(c, CFG)
