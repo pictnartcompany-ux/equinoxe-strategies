@@ -10,13 +10,26 @@
   },
 
   "score_threshold": 3,
-  "max_items_per_feed": 12,
+  "max_items_per_feed": 20,
 
   "sources": [
     "https://spacenews.com/feed/",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://www.space.com/feeds/all",
+
+    "https://spectrum.ieee.org/feeds/topic/artificial-intelligence.rss",
+    "https://feed.infoq.com/ai-ml-data-eng/",
+    "https://huggingface.co/blog/feed.xml",
     "https://techcrunch.com/feed/",
-    "https://www.economist.com/finance-and-economics/rss.xml"
+
+    "https://www.semianalysis.com/feed/",
+    "https://www.semiconductor-today.com/rss.shtml",
+    "https://sst.semiconductor-digest.com/rss-page/",
+
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+
+    "https://www.economist.com/finance-and-economics/rss.xml",
+    "https://feeds.reuters.com/reuters/businessNews"
   ],
 
   "posting": {
@@ -38,9 +51,16 @@
       "ai", "semiconductor", "gpu", "nvidia",
       "crypto", "bitcoin", "blockchain"
     ],
-    "max_likes_per_run": 1,
+    "max_likes_per_run": 3,
     "max_follows_per_run": 0,
     "min_engagement_like": 5,
     "follow_only_if_posted_recently_hours": 72
-  }
+  },
+
+  "history_file": "history.json",
+  "history_days": 10,
+  "top_k_sample": 8,
+  "diversity_penalty": 0.8,
+  "sim_title_thresh": 0.78,
+  "recency_half_life_days": 2
 }
