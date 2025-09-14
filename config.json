@@ -60,7 +60,7 @@
   "history_file": "history.json",
   "history_days": 10,
   "top_k_sample": 8,
-  "diversity_penalty": 0.8,
-  "sim_title_thresh": 0.78,
-  "recency_half_life_days": 2
+  "diversity_penalty": 1.25,
+  "sim_title_thresh": 0.9,
+  "recency_half_life_days": 1.5
 }
