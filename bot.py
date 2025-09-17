@@ -86,17 +86,37 @@ def save_history(items):
         pass
 
 def remember_post(link: str, title: str):
+    now = datetime.now(timezone.utc)
     hist = load_history()
-    hist.append({"link": link, "title": title, "ts": datetime.now(timezone.utc).isoformat()})
+    hist.append({"link": link, "title": title, "ts": now.isoformat()})
+
     seen = set()
     dedup = []
-    for it in reversed(hist):
+    for it in reversed(hist):  # garde la version la plus récente
         key = (it.get("link") or "").strip() or (it.get("title") or "").strip().lower()
         if key in seen:
             continue
         seen.add(key)
         dedup.append(it)
-    save_history(list(reversed(dedup)))
+    hist = list(reversed(dedup))
+
+    # ---- purge par ancienneté ----
+    cutoff = now - timedelta(days=HISTORY_DAYS)
+    def fresh(it):
+        try:
+            dt = datetime.fromisoformat(it["ts"])
+            if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+            return dt >= cutoff
+        except Exception:
+            return False
+    hist = [it for it in hist if fresh(it)]
+
+    # ---- cap de sécurité ----
+    MAX_ROWS = 5000
+    if len(hist) > MAX_ROWS:
+        hist = hist[-MAX_ROWS:]
+
+    save_history(hist)
 
 def get_domain(url: str) -> str:
     try:
