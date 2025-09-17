@@ -58,7 +58,7 @@
   },
 
   "history_file": "history.json",
-  "history_days": 10,
+  "history_days": 30,
   "top_k_sample": 8,
   "diversity_penalty": 1.25,
   "sim_title_thresh": 0.9,
